@@ -7,7 +7,9 @@
 #include "IContentBrowserSingleton.h"
 #include "Modules/ModuleManager.h"
 #include "Misc/Paths.h"
+#include "Misc/FileHelper.h"
 #include "Misc/ConfigCacheIni.h"
+#include "Misc/MessageDialog.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformApplicationMisc.h"
@@ -951,10 +953,63 @@ FReply SEasyCookTab::OnRunCookClicked()
 	}
 	const FString EditorExe = FPlatformProcess::ExecutablePath();
 	const FString Params = BuildArgsOnlyString();
+	const FString FullCommand = FString::Printf(TEXT("%s %s"), *QuoteIfNeeded(EditorExe), *Params);
+	const int32 CmdLimit = 8191;
+	const int32 HardLimit = 32000;
+
+	bool bRunViaPowerShell = false;
+
+	if (FullCommand.Len() > HardLimit)
+	{
+		FText Message = FText::Format(LOCTEXT("CommandTooLong", "The generated command line is too long ({0} characters). The limit is 32,000 characters.\n\nPlease reduce the number of selected assets or folders."), FText::AsNumber(FullCommand.Len()));
+		FMessageDialog::Open(EAppMsgType::Ok, Message);
+		
+		OutputBuffer = TEXT("Command line too long. Cook aborted.\n");
+		if (OutputLog.IsValid())
+		{
+			OutputLog->SetText(FText::FromString(OutputBuffer));
+		}
+		return FReply::Handled();
+	}
+	else if (FullCommand.Len() > CmdLimit)
+	{
+		FText Message = FText::Format(LOCTEXT("CommandLongWarning", "The generated command line is long ({0} characters) and exceeds the standard command prompt limit (8191).\n\nDo you want to run it via a temporary PowerShell script to avoid truncation?"), FText::AsNumber(FullCommand.Len()));
+		EAppReturnType::Type Result = FMessageDialog::Open(EAppMsgType::YesNo, Message);
+		
+		if (Result == EAppReturnType::Yes)
+		{
+			bRunViaPowerShell = true;
+		}
+	}
 
 	ReadPipe = nullptr; WritePipe = nullptr;
 	FPlatformProcess::CreatePipe(ReadPipe, WritePipe);
-	ProcHandle = FPlatformProcess::CreateProc(*EditorExe, *Params, false, true, true, nullptr, 0, nullptr, WritePipe);
+
+	if (bRunViaPowerShell)
+	{
+		FString ScriptContent = FString::Printf(TEXT("& \"%s\" %s | Out-Host"), *EditorExe, *Params);
+		FString TempScriptPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("TempCookScript.ps1"));
+		
+		if (FFileHelper::SaveStringToFile(ScriptContent, *TempScriptPath))
+		{
+			FString PSParams = FString::Printf(TEXT("-ExecutionPolicy Bypass -File \"%s\""), *TempScriptPath);
+			ProcHandle = FPlatformProcess::CreateProc(TEXT("powershell.exe"), *PSParams, false, true, true, nullptr, 0, nullptr, WritePipe);
+		}
+		else
+		{
+			OutputBuffer = TEXT("Failed to save temp PowerShell script.\n");
+			if (OutputLog.IsValid())
+			{
+				OutputLog->SetText(FText::FromString(OutputBuffer));
+			}
+			return FReply::Handled();
+		}
+	}
+	else
+	{
+		ProcHandle = FPlatformProcess::CreateProc(*EditorExe, *Params, false, true, true, nullptr, 0, nullptr, WritePipe);
+	}
+
 	bCookRunning = ProcHandle.IsValid();
 	if (!bCookRunning)
 	{
